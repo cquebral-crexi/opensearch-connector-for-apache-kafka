@@ -91,9 +91,23 @@ public class OpensearchClient implements AutoCloseable {
         this(config, null);
     }
 
+    // modified
     public OpensearchClient(final OpensearchSinkConnectorConfig config, final ErrantRecordReporter reporter) {
-        this(new RestHighLevelClient(RestClient.builder(config.httpHosts())
-                .setHttpClientConfigCallback(new HttpClientConfigCallback(config))), config, reporter);
+        // Create RestClientBuilder
+        RestClientBuilder builder = RestClient.builder(config.httpHosts());
+        
+        // Configure AWS authentication if enabled
+        if (config.isAwsIamAuthEnabled()) {
+            new AwsAuthenticationHelper(config).configureAwsAuthentication(builder);
+        }
+        
+        // Configure HTTP client settings
+        builder.setHttpClientConfigCallback(new HttpClientConfigCallback(config));
+        
+        this.client = new RestHighLevelClient(builder);
+        this.config = config;
+        this.bulkProcessor = new BulkProcessor(Time.SYSTEM, client, config, reporter);
+        this.bulkProcessor.start();
     }
 
     protected OpensearchClient(final RestHighLevelClient client, final OpensearchSinkConnectorConfig config,
@@ -238,22 +252,26 @@ public class OpensearchClient implements AutoCloseable {
 
         @Override
         public HttpAsyncClientBuilder customizeHttpClient(final HttpAsyncClientBuilder httpClientBuilder) {
+            // Configure request timeouts
             final var requestConfig = RequestConfig.custom()
                     .setConnectTimeout(config.connectionTimeoutMs())
                     .setConnectionRequestTimeout(config.readTimeoutMs())
                     .setSocketTimeout(config.readTimeoutMs())
                     .build();
 
+            // Apply custom configurators
             final Collection<OpensearchClientConfigurator> configurators = ClientsConfiguratorProvider
                     .forOpensearch(config);
             configurators.forEach(configurator -> {
                 if (configurator.apply(config, httpClientBuilder)) {
-                    LOGGER.debug("Successfuly applied " + configurator.getClass().getName()
+                    LOGGER.debug("Successfully applied " + configurator.getClass().getName()
                             + " configurator to OpensearchClient");
                 }
             });
 
-            httpClientBuilder.setConnectionManager(createConnectionManager()).setDefaultRequestConfig(requestConfig);
+            // Configure connection pooling
+            httpClientBuilder.setConnectionManager(createConnectionManager())
+                           .setDefaultRequestConfig(requestConfig);
 
             return httpClientBuilder;
         }
@@ -265,13 +283,17 @@ public class OpensearchClient implements AutoCloseable {
                         .setSoTimeout(config.readTimeoutMs())
                         .build();
 
+                // Configure SSL if needed
                 final var sslStrategy = new SSLIOSessionStrategy(
                         SSLContexts.custom().loadTrustMaterial(new TrustSelfSignedStrategy()).build(),
                         new NoopHostnameVerifier());
+
                 final var registry = RegistryBuilder.<SchemeIOSessionStrategy>create()
                         .register("http", NoopIOSessionStrategy.INSTANCE)
                         .register("https", sslStrategy)
                         .build();
+
+                // Create and configure connection manager
                 final var connectionManager = new PoolingNHttpClientConnectionManager(
                         new DefaultConnectingIOReactor(ioReactorConfig), registry);
                 final var maxPerRoute = Math.max(10, config.maxInFlightRequests() * 2);
@@ -280,10 +302,9 @@ public class OpensearchClient implements AutoCloseable {
                 return connectionManager;
             } catch (final IOReactorException | NoSuchAlgorithmException | KeyStoreException
                     | KeyManagementException e) {
-                throw new ConnectException("Unable to open ElasticsearchClient.", e);
+                throw new ConnectException("Unable to create OpenSearch connection manager.", e);
             }
         }
-
     }
 
     public <T> T withRetry(final String callName, final Callable<T> callable) {
