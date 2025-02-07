@@ -31,6 +31,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.TreeMap;
 import java.util.Map;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+import java.net.URLEncoder;
+import java.lang.reflect.Field;
+import org.apache.http.message.BasicRequestLine;
 
 public class AwsAuthenticationHelper {
     private static final Logger LOGGER = LoggerFactory.getLogger(AwsAuthenticationHelper.class);
@@ -51,13 +57,19 @@ public class AwsAuthenticationHelper {
             return;
         }
 
-        final AWS4Signer signer = new AWS4Signer(false);  // false = don't double-url-encode
+        final AWS4Signer signer = new AWS4Signer(false);
         String endpoint = config.httpHosts()[0].toURI();
         
         signer.setServiceName("aoss");
         signer.setRegionName(config.awsRegion());
 
         final AWSCredentialsProvider credentialsProvider = createCredentialsProvider();
+
+        // List of parameters to exclude
+        final Set<String> excludedParams = new HashSet<>(Arrays.asList(
+            "master_timeout",
+            "timeout"
+        ));
 
         HttpRequestInterceptor interceptor = new HttpRequestInterceptor() {
             @Override
@@ -68,51 +80,53 @@ public class AwsAuthenticationHelper {
                     LOGGER.info("Processing {} request for URI: {}", method, originalUri);
 
                     Request<?> awsRequest = new DefaultRequest<>("aoss");
-                    
                     URI endpointUri = new URI(endpoint);
                     String path = originalUri.split("\\?")[0];
                     String query = originalUri.contains("?") ? originalUri.split("\\?")[1] : null;
                     
                     // Set the endpoint first
                     awsRequest.setEndpoint(endpointUri);
-                    
-                    // Set the resource path (must start with /)
                     awsRequest.setResourcePath(path);
-                    
-                    // Set HTTP method
                     awsRequest.setHttpMethod(HttpMethodName.valueOf(method));
                     
-                    // Add canonical headers in specific order
-                    TreeMap<String, String> headers = new TreeMap<>();
-                    headers.put("host", endpointUri.getHost());
-                    headers.put("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-                    
-                    // Add headers to request
-                    for (Map.Entry<String, String> header : headers.entrySet()) {
-                        awsRequest.addHeader(header.getKey(), header.getValue());
-                    }
+                    // Add canonical headers
+                    awsRequest.addHeader("host", endpointUri.getHost());
+                    awsRequest.addHeader("x-amz-content-sha256", 
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 
                     // Handle query parameters
+                    StringBuilder finalQueryString = new StringBuilder();
+                    TreeMap<String, List<String>> filteredParams = new TreeMap<>();
+                    
                     if (query != null) {
                         LOGGER.info("Processing query parameters: {}", query);
-                        TreeMap<String, List<String>> queryParams = new TreeMap<>();
+                        boolean isFirst = true;
                         
                         for (String param : query.split("&")) {
                             String[] keyValue = param.split("=", 2);
                             if (keyValue.length == 2) {
                                 String key = URLDecoder.decode(keyValue[0], StandardCharsets.UTF_8);
+                                
+                                // Skip excluded parameters
+                                if (excludedParams.contains(key)) {
+                                    LOGGER.debug("Skipping excluded parameter: {}", key);
+                                    continue;
+                                }
+                                
                                 String value = URLDecoder.decode(keyValue[1], StandardCharsets.UTF_8);
                                 
-                                queryParams.computeIfAbsent(key, k -> new ArrayList<>()).add(value);
-                            }
-                        }
-                        
-                        // Add sorted parameters to request
-                        for (Map.Entry<String, List<String>> entry : queryParams.entrySet()) {
-                            String key = entry.getKey();
-                            for (String value : entry.getValue()) {
+                                // Add to AWS request
                                 awsRequest.addParameter(key, value);
                                 LOGGER.info("Added query param: {} = {}", key, value);
+                                
+                                // Build query string for final URI
+                                if (!isFirst) {
+                                    finalQueryString.append("&");
+                                }
+                                finalQueryString.append(URLEncoder.encode(key, StandardCharsets.UTF_8))
+                                              .append("=")
+                                              .append(URLEncoder.encode(value, StandardCharsets.UTF_8));
+                                isFirst = false;
                             }
                         }
                     }
@@ -125,7 +139,7 @@ public class AwsAuthenticationHelper {
                         request.removeHeader(header);
                     }
                     
-                    // Add all headers from signed request, maintaining their case
+                    // Add signed headers
                     for (Map.Entry<String, String> header : awsRequest.getHeaders().entrySet()) {
                         request.addHeader(header.getKey(), header.getValue());
                         if (header.getKey().equalsIgnoreCase("Authorization")) {
@@ -133,6 +147,21 @@ public class AwsAuthenticationHelper {
                         } else {
                             LOGGER.info("Added header: {} = {}", header.getKey(), header.getValue());
                         }
+                    }
+
+                    // Create the final URI
+                    String finalUri = path;
+                    if (finalQueryString.length() > 0) {
+                        finalUri += "?" + finalQueryString.toString();
+                    }
+                    
+                    // Set the final URI using reflection since HttpRequest doesn't have setRequestLine
+                    try {
+                        Field uriField = request.getRequestLine().getClass().getDeclaredField("uri");
+                        uriField.setAccessible(true);
+                        uriField.set(request.getRequestLine(), finalUri);
+                    } catch (Exception e) {
+                        LOGGER.warn("Could not modify request URI: {}", e.getMessage());
                     }
                     
                     LOGGER.info("Final request URI: {}", request.getRequestLine().getUri());
