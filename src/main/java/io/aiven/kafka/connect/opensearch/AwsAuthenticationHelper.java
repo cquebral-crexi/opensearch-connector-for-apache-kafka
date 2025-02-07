@@ -23,7 +23,14 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.Map;
 import java.util.TreeMap;
-
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.TreeMap;
+import java.util.Map;
 
 public class AwsAuthenticationHelper {
     private static final Logger LOGGER = LoggerFactory.getLogger(AwsAuthenticationHelper.class);
@@ -44,13 +51,8 @@ public class AwsAuthenticationHelper {
             return;
         }
 
-        final AWS4Signer signer = new AWS4Signer();
+        final AWS4Signer signer = new AWS4Signer(false);  // false = don't double-url-encode
         String endpoint = config.httpHosts()[0].toURI();
-        boolean isServerless = endpoint.contains(".aoss.");
-        String serviceName = isServerless ? "aoss" : "es";
-        
-        LOGGER.info("AWS authentication details - Endpoint: {}, Service: {}, Region: {}", 
-            endpoint, serviceName, config.awsRegion());
         
         signer.setServiceName("aoss");
         signer.setRegionName(config.awsRegion());
@@ -62,92 +64,78 @@ public class AwsAuthenticationHelper {
             public void process(HttpRequest request, HttpContext context) throws IOException {
                 try {
                     String originalUri = request.getRequestLine().getUri();
-                    LOGGER.info("Processing request for URI: {}", originalUri);
+                    String method = request.getRequestLine().getMethod();
+                    LOGGER.info("Processing {} request for URI: {}", method, originalUri);
 
-                    // Create AWS Request
                     Request<?> awsRequest = new DefaultRequest<>("aoss");
                     
-                    // Parse and build the URI, keeping original encoding
                     URI endpointUri = new URI(endpoint);
                     String path = originalUri.split("\\?")[0];
                     String query = originalUri.contains("?") ? originalUri.split("\\?")[1] : null;
                     
-                    // Build the full URL without double-encoding
-                    StringBuilder fullUrl = new StringBuilder();
-                    fullUrl.append(endpointUri.getScheme()).append("://")
-                           .append(endpointUri.getHost());
-                    if (endpointUri.getPort() > 0) {
-                        fullUrl.append(":").append(endpointUri.getPort());
-                    }
-                    fullUrl.append(path);
-                    if (query != null) {
-                        fullUrl.append("?").append(query);
-                    }
+                    // Set the endpoint first
+                    awsRequest.setEndpoint(endpointUri);
                     
-                    LOGGER.info("Full URL for signing: {}", fullUrl.toString());
-                    awsRequest.setEndpoint(new URI(fullUrl.toString()));
+                    // Set the resource path (must start with /)
+                    awsRequest.setResourcePath(path);
                     
-                    // Set method
-                    String method = request.getRequestLine().getMethod();
+                    // Set HTTP method
                     awsRequest.setHttpMethod(HttpMethodName.valueOf(method));
                     
-                    // Set headers exactly matching Python
-                    awsRequest.addHeader("User-Agent", "python-requests/2.32.3");
-                    awsRequest.addHeader("Accept-Encoding", "gzip, deflate, br, zstd");
-                    awsRequest.addHeader("Accept", "*/*");
-                    awsRequest.addHeader("Connection", "keep-alive");
-                    awsRequest.addHeader("Content-Type", "application/json");
-                    awsRequest.addHeader("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+                    // Add canonical headers in specific order
+                    TreeMap<String, String> headers = new TreeMap<>();
+                    headers.put("host", endpointUri.getHost());
+                    headers.put("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
                     
-                    // Handle query parameters without additional encoding
+                    // Add headers to request
+                    for (Map.Entry<String, String> header : headers.entrySet()) {
+                        awsRequest.addHeader(header.getKey(), header.getValue());
+                    }
+
+                    // Handle query parameters
                     if (query != null) {
+                        LOGGER.info("Processing query parameters: {}", query);
+                        TreeMap<String, List<String>> queryParams = new TreeMap<>();
+                        
                         for (String param : query.split("&")) {
                             String[] keyValue = param.split("=", 2);
                             if (keyValue.length == 2) {
-                                // Use the parameters as-is without additional decoding/encoding
-                                awsRequest.addParameter(keyValue[0], keyValue[1]);
+                                String key = URLDecoder.decode(keyValue[0], StandardCharsets.UTF_8);
+                                String value = URLDecoder.decode(keyValue[1], StandardCharsets.UTF_8);
+                                
+                                queryParams.computeIfAbsent(key, k -> new ArrayList<>()).add(value);
+                            }
+                        }
+                        
+                        // Add sorted parameters to request
+                        for (Map.Entry<String, List<String>> entry : queryParams.entrySet()) {
+                            String key = entry.getKey();
+                            for (String value : entry.getValue()) {
+                                awsRequest.addParameter(key, value);
+                                LOGGER.info("Added query param: {} = {}", key, value);
                             }
                         }
                     }
 
-                    // Configure signer
-                    AWS4Signer signer = new AWS4Signer(false);  // false = don't double-url-encode
-                    signer.setServiceName("aoss");
-                    signer.setRegionName(config.awsRegion());
-
                     // Sign the request
-                    LOGGER.info("Signing request");
                     signer.sign(awsRequest, credentialsProvider.getCredentials());
-                    
+
                     // Clear existing headers
                     for (org.apache.http.Header header : request.getAllHeaders()) {
                         request.removeHeader(header);
                     }
                     
-                    // Add back signed headers in the exact order as Python
-                    String[] headerOrder = {
-                        "User-Agent",
-                        "Accept-Encoding",
-                        "Accept",
-                        "Connection",
-                        "Content-Type",
-                        "x-amz-date",
-                        "x-amz-content-sha256",
-                        "Authorization"
-                    };
-                    
-                    for (String headerName : headerOrder) {
-                        String value = awsRequest.getHeaders().get(headerName);
-                        if (value != null) {
-                            request.addHeader(headerName, value);
-                            LOGGER.info("Added header: {} = {}", 
-                                headerName,
-                                headerName.equalsIgnoreCase("Authorization") ? "[REDACTED]" : value);
+                    // Add all headers from signed request, maintaining their case
+                    for (Map.Entry<String, String> header : awsRequest.getHeaders().entrySet()) {
+                        request.addHeader(header.getKey(), header.getValue());
+                        if (header.getKey().equalsIgnoreCase("Authorization")) {
+                            LOGGER.info("Authorization header: {}", header.getValue());
+                        } else {
+                            LOGGER.info("Added header: {} = {}", header.getKey(), header.getValue());
                         }
                     }
                     
                     LOGGER.info("Final request URI: {}", request.getRequestLine().getUri());
-                    LOGGER.info("Request signing completed");
                 } catch (Exception e) {
                     LOGGER.error("Error during request signing", e);
                     throw new IOException("Error during request signing: " + e.getMessage(), e);

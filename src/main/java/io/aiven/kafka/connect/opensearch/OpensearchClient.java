@@ -36,6 +36,10 @@ import org.opensearch.client.RequestOptions;
 import org.opensearch.client.RestClient;
 import org.opensearch.client.RestClientBuilder;
 import org.opensearch.client.RestHighLevelClient;
+import org.opensearch.client.indices.GetMappingsRequest;
+import org.opensearch.client.indices.GetMappingsResponse;
+import org.opensearch.client.indices.PutMappingRequest;
+import org.opensearch.client.RequestOptions;
 import org.opensearch.client.indices.ComposableIndexTemplateExistRequest;
 import org.opensearch.client.indices.CreateDataStreamRequest;
 import org.opensearch.client.indices.CreateIndexRequest;
@@ -207,17 +211,30 @@ public class OpensearchClient implements AutoCloseable {
     }
 
     public void createMapping(final String index, final Schema schema) {
-        final var request = new PutMappingRequest(index).source(Mapping.buildMappingFor(schema));
+        PutMappingRequest request = new PutMappingRequest(index);
+        request.source(Mapping.buildMappingFor(schema));
+        
         withRetry(String.format("create mapping for index %s with schema %s", index, schema),
                 () -> client.indices().putMapping(request, RequestOptions.DEFAULT));
     }
 
     public boolean hasMapping(final String index) {
-        final var request = new GetMappingsRequest().indices(index);
-        final var response = withRetry("", () -> client.indices().getMapping(request, RequestOptions.DEFAULT));
-        final var mappings = response.mappings().get(index);
-        return Objects.nonNull(mappings) && Objects.nonNull(mappings.sourceAsMap())
-                && !mappings.sourceAsMap().isEmpty();
+        GetMappingsRequest request = new GetMappingsRequest();
+        request.indices(index);
+        
+        try {
+            final GetMappingsResponse response = withRetry("get mapping", () -> 
+                client.indices().getMapping(request, RequestOptions.DEFAULT));
+            
+            // Check if we have mappings for this index
+            return response != null && 
+                   response.mappings() != null && 
+                   response.mappings().get(index) != null &&
+                   !response.mappings().get(index).sourceAsMap().isEmpty();
+        } catch (Exception e) {
+            LOGGER.warn("Error checking mapping for index {}: {}", index, e.getMessage());
+            return false;
+        }
     }
 
     public void index(final DocWriteRequest<?> indexRequest, final SinkRecord record) {
