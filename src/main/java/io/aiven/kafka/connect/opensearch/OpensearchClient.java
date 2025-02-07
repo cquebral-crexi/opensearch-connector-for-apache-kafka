@@ -91,32 +91,31 @@ public class OpensearchClient implements AutoCloseable {
         this(config, null);
     }
 
-    // modified
     public OpensearchClient(final OpensearchSinkConnectorConfig config, final ErrantRecordReporter reporter) {
-        // Create RestClientBuilder
+        LOGGER.info("Initializing OpensearchClient");
         RestClientBuilder builder = RestClient.builder(config.httpHosts());
         
         // Configure AWS authentication if enabled
         if (config.isAwsIamAuthEnabled()) {
+            LOGGER.info("AWS IAM auth is enabled, configuring authentication");
             new AwsAuthenticationHelper(config).configureAwsAuthentication(builder);
+            LOGGER.info("AWS authentication configured");
         }
-        
-        // Configure HTTP client settings
-        builder.setHttpClientConfigCallback(new HttpClientConfigCallback(config));
         
         this.client = new RestHighLevelClient(builder);
         this.config = config;
         this.bulkProcessor = new BulkProcessor(Time.SYSTEM, client, config, reporter);
         this.bulkProcessor.start();
+        LOGGER.info("OpensearchClient initialization completed");
     }
 
-    protected OpensearchClient(final RestHighLevelClient client, final OpensearchSinkConnectorConfig config,
-            final ErrantRecordReporter reporter) {
-        this.client = client;
-        this.config = config;
-        this.bulkProcessor = new BulkProcessor(Time.SYSTEM, client, config, reporter);
-        this.bulkProcessor.start();
-    }
+    // protected OpensearchClient(final RestHighLevelClient client, final OpensearchSinkConnectorConfig config,
+    //         final ErrantRecordReporter reporter) {
+    //     this.client = client;
+    //     this.config = config;
+    //     this.bulkProcessor = new BulkProcessor(Time.SYSTEM, client, config, reporter);
+    //     this.bulkProcessor.start();
+    // }
 
     public String getVersion() {
         return withRetry("get version", () -> {
