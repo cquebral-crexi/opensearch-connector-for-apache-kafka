@@ -36,6 +36,10 @@ import org.opensearch.client.RequestOptions;
 import org.opensearch.client.RestClient;
 import org.opensearch.client.RestClientBuilder;
 import org.opensearch.client.RestHighLevelClient;
+import org.opensearch.client.indices.GetMappingsRequest;
+import org.opensearch.client.indices.GetMappingsResponse;
+import org.opensearch.client.indices.PutMappingRequest;
+import org.opensearch.client.RequestOptions;
 import org.opensearch.client.indices.ComposableIndexTemplateExistRequest;
 import org.opensearch.client.indices.CreateDataStreamRequest;
 import org.opensearch.client.indices.CreateIndexRequest;
@@ -92,17 +96,30 @@ public class OpensearchClient implements AutoCloseable {
     }
 
     public OpensearchClient(final OpensearchSinkConnectorConfig config, final ErrantRecordReporter reporter) {
-        this(new RestHighLevelClient(RestClient.builder(config.httpHosts())
-                .setHttpClientConfigCallback(new HttpClientConfigCallback(config))), config, reporter);
-    }
-
-    protected OpensearchClient(final RestHighLevelClient client, final OpensearchSinkConnectorConfig config,
-            final ErrantRecordReporter reporter) {
-        this.client = client;
+        LOGGER.info("Initializing OpensearchClient");
+        RestClientBuilder builder = RestClient.builder(config.httpHosts());
+        
+        // Configure AWS authentication if enabled
+        if (config.isAwsIamAuthEnabled()) {
+            LOGGER.info("AWS IAM auth is enabled, configuring authentication");
+            new AwsAuthenticationHelper(config).configureAwsAuthentication(builder);
+            LOGGER.info("AWS authentication configured");
+        }
+        
+        this.client = new RestHighLevelClient(builder);
         this.config = config;
         this.bulkProcessor = new BulkProcessor(Time.SYSTEM, client, config, reporter);
         this.bulkProcessor.start();
+        LOGGER.info("OpensearchClient initialization completed");
     }
+
+    // protected OpensearchClient(final RestHighLevelClient client, final OpensearchSinkConnectorConfig config,
+    //         final ErrantRecordReporter reporter) {
+    //     this.client = client;
+    //     this.config = config;
+    //     this.bulkProcessor = new BulkProcessor(Time.SYSTEM, client, config, reporter);
+    //     this.bulkProcessor.start();
+    // }
 
     public String getVersion() {
         return withRetry("get version", () -> {
@@ -194,17 +211,30 @@ public class OpensearchClient implements AutoCloseable {
     }
 
     public void createMapping(final String index, final Schema schema) {
-        final var request = new PutMappingRequest(index).source(Mapping.buildMappingFor(schema));
+        PutMappingRequest request = new PutMappingRequest(index);
+        request.source(Mapping.buildMappingFor(schema));
+        
         withRetry(String.format("create mapping for index %s with schema %s", index, schema),
                 () -> client.indices().putMapping(request, RequestOptions.DEFAULT));
     }
 
     public boolean hasMapping(final String index) {
-        final var request = new GetMappingsRequest().indices(index);
-        final var response = withRetry("", () -> client.indices().getMapping(request, RequestOptions.DEFAULT));
-        final var mappings = response.mappings().get(index);
-        return Objects.nonNull(mappings) && Objects.nonNull(mappings.sourceAsMap())
-                && !mappings.sourceAsMap().isEmpty();
+        GetMappingsRequest request = new GetMappingsRequest();
+        request.indices(index);
+        
+        try {
+            final GetMappingsResponse response = withRetry("get mapping", () -> 
+                client.indices().getMapping(request, RequestOptions.DEFAULT));
+            
+            // Check if we have mappings for this index
+            return response != null && 
+                   response.mappings() != null && 
+                   response.mappings().get(index) != null &&
+                   !response.mappings().get(index).sourceAsMap().isEmpty();
+        } catch (Exception e) {
+            LOGGER.warn("Error checking mapping for index {}: {}", index, e.getMessage());
+            return false;
+        }
     }
 
     public void index(final DocWriteRequest<?> indexRequest, final SinkRecord record) {
@@ -238,22 +268,26 @@ public class OpensearchClient implements AutoCloseable {
 
         @Override
         public HttpAsyncClientBuilder customizeHttpClient(final HttpAsyncClientBuilder httpClientBuilder) {
+            // Configure request timeouts
             final var requestConfig = RequestConfig.custom()
                     .setConnectTimeout(config.connectionTimeoutMs())
                     .setConnectionRequestTimeout(config.readTimeoutMs())
                     .setSocketTimeout(config.readTimeoutMs())
                     .build();
 
+            // Apply custom configurators
             final Collection<OpensearchClientConfigurator> configurators = ClientsConfiguratorProvider
                     .forOpensearch(config);
             configurators.forEach(configurator -> {
                 if (configurator.apply(config, httpClientBuilder)) {
-                    LOGGER.debug("Successfuly applied " + configurator.getClass().getName()
+                    LOGGER.debug("Successfully applied " + configurator.getClass().getName()
                             + " configurator to OpensearchClient");
                 }
             });
 
-            httpClientBuilder.setConnectionManager(createConnectionManager()).setDefaultRequestConfig(requestConfig);
+            // Configure connection pooling
+            httpClientBuilder.setConnectionManager(createConnectionManager())
+                           .setDefaultRequestConfig(requestConfig);
 
             return httpClientBuilder;
         }
@@ -265,13 +299,17 @@ public class OpensearchClient implements AutoCloseable {
                         .setSoTimeout(config.readTimeoutMs())
                         .build();
 
+                // Configure SSL if needed
                 final var sslStrategy = new SSLIOSessionStrategy(
                         SSLContexts.custom().loadTrustMaterial(new TrustSelfSignedStrategy()).build(),
                         new NoopHostnameVerifier());
+
                 final var registry = RegistryBuilder.<SchemeIOSessionStrategy>create()
                         .register("http", NoopIOSessionStrategy.INSTANCE)
                         .register("https", sslStrategy)
                         .build();
+
+                // Create and configure connection manager
                 final var connectionManager = new PoolingNHttpClientConnectionManager(
                         new DefaultConnectingIOReactor(ioReactorConfig), registry);
                 final var maxPerRoute = Math.max(10, config.maxInFlightRequests() * 2);
@@ -280,10 +318,9 @@ public class OpensearchClient implements AutoCloseable {
                 return connectionManager;
             } catch (final IOReactorException | NoSuchAlgorithmException | KeyStoreException
                     | KeyManagementException e) {
-                throw new ConnectException("Unable to open ElasticsearchClient.", e);
+                throw new ConnectException("Unable to create OpenSearch connection manager.", e);
             }
         }
-
     }
 
     public <T> T withRetry(final String callName, final Callable<T> callable) {

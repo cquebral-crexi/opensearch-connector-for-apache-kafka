@@ -49,6 +49,22 @@ public class OpensearchSinkConnectorConfig extends AbstractConfig {
     public static final String DATA_STREAM_GROUP_NAME = "Data Stream";
 
     public static final String DATA_CONVERSION_GROUP_NAME = "Data Conversion";
+    public static final String AWS_GROUP_NAME = "AWS";
+
+    // AWS configuration constants
+    public static final String AWS_ACCESS_KEY_ID_CONFIG = "aws.access.key.id";
+    public static final String AWS_SECRET_KEY_CONFIG = "aws.secret.access.key";
+    public static final String AWS_REGION_CONFIG = "aws.region";
+    public static final String AWS_IAM_AUTH_CONFIG = "aws.iam.auth.enabled";
+    public static final String AWS_SESSION_TOKEN_CONFIG = "aws.session.token";
+    public static final String AWS_ROLE_ARN_CONFIG = "aws.role.arn";
+
+    private static final String AWS_ACCESS_KEY_DOC = "AWS Access Key ID for IAM authentication.";
+    private static final String AWS_SECRET_KEY_DOC = "AWS Secret Access Key for IAM authentication.";
+    private static final String AWS_REGION_DOC = "AWS Region for the OpenSearch domain.";
+    private static final String AWS_IAM_AUTH_DOC = "Enable AWS IAM authentication for OpenSearch.";
+    private static final String AWS_SESSION_TOKEN_DOC = "AWS Session Token (optional) for temporary credentials.";
+    private static final String AWS_ROLE_ARN_DOC = "AWS IAM Role ARN to assume (optional).";
 
     public static final String CONNECTION_URL_CONFIG = "connection.url";
     private static final String CONNECTION_URL_DOC = "List of OpenSearch HTTP connection URLs e.g. ``http://eshost1:9200,"
@@ -193,7 +209,80 @@ public class OpensearchSinkConnectorConfig extends AbstractConfig {
         addConversionConfigs(configDef);
         addDataStreamConfig(configDef);
         addSpiConfigs(configDef);
+        addAwsConfigs(configDef);
         return configDef;
+    }
+
+    private static void addAwsConfigs(final ConfigDef configDef) {
+        int order = 0;
+        configDef
+            .define(
+                AWS_IAM_AUTH_CONFIG,
+                Type.BOOLEAN,
+                false,
+                Importance.HIGH,
+                AWS_IAM_AUTH_DOC,
+                AWS_GROUP_NAME,
+                ++order,
+                Width.SHORT,
+                "Enable AWS IAM Authentication"
+            )
+            .define(
+                AWS_REGION_CONFIG,
+                Type.STRING,
+                ConfigDef.NO_DEFAULT_VALUE,
+                new ConfigDef.NonEmptyString(),
+                Importance.HIGH,
+                AWS_REGION_DOC,
+                AWS_GROUP_NAME,
+                ++order,
+                Width.SHORT,
+                "AWS Region"
+            )
+            .define(
+                AWS_ACCESS_KEY_ID_CONFIG,
+                Type.STRING,
+                "",
+                Importance.MEDIUM,
+                AWS_ACCESS_KEY_DOC,
+                AWS_GROUP_NAME,
+                ++order,
+                Width.SHORT,
+                "AWS Access Key ID"
+            )
+            .define(
+                AWS_SECRET_KEY_CONFIG,
+                Type.PASSWORD,
+                "",
+                Importance.MEDIUM,
+                AWS_SECRET_KEY_DOC,
+                AWS_GROUP_NAME,
+                ++order,
+                Width.SHORT,
+                "AWS Secret Access Key"
+            )
+            .define(
+                AWS_SESSION_TOKEN_CONFIG,
+                Type.PASSWORD,
+                "",
+                Importance.LOW,
+                AWS_SESSION_TOKEN_DOC,
+                AWS_GROUP_NAME,
+                ++order,
+                Width.SHORT,
+                "AWS Session Token"
+            )
+            .define(
+                AWS_ROLE_ARN_CONFIG,
+                Type.STRING,
+                "",
+                Importance.LOW,
+                AWS_ROLE_ARN_DOC,
+                AWS_GROUP_NAME,
+                ++order,
+                Width.SHORT,
+                "AWS Role ARN"
+            );
     }
 
     /**
@@ -334,6 +423,21 @@ public class OpensearchSinkConnectorConfig extends AbstractConfig {
                     String.format("%s is not supported for index upsert. Supported is: %s",
                             documentIdStrategy().toString(), DocumentIDStrategy.RECORD_KEY));
         }
+        if (isAwsIamAuthEnabled()) {
+            if (getString(AWS_REGION_CONFIG).isEmpty()) {
+                throw new ConfigException(AWS_REGION_CONFIG, 
+                    "AWS Region must be specified when AWS IAM authentication is enabled");
+            }
+            
+            // Validate credentials configuration
+            final boolean hasCredentials = awsAccessKeyId().isPresent() && awsSecretKey().isPresent();
+            final boolean hasRoleArn = awsRoleArn().isPresent();
+            
+            if (!hasCredentials && !hasRoleArn) {
+                throw new ConfigException(
+                    "When AWS IAM authentication is enabled, either AWS credentials or Role ARN must be provided");
+            }
+        }
     }
 
     public HttpHost[] httpHosts() {
@@ -345,6 +449,34 @@ public class OpensearchSinkConnectorConfig extends AbstractConfig {
             idx++;
         }
         return httpHosts;
+    }
+
+    public boolean isAwsIamAuthEnabled() {
+        return getBoolean(AWS_IAM_AUTH_CONFIG);
+    }
+
+    public String awsRegion() {
+        return getString(AWS_REGION_CONFIG);
+    }
+
+    public Optional<String> awsAccessKeyId() {
+        final String accessKeyId = getString(AWS_ACCESS_KEY_ID_CONFIG);
+        return Optional.ofNullable(accessKeyId).filter(s -> !s.isEmpty());
+    }
+
+    public Optional<String> awsSecretKey() {
+        final String secretKey = getPassword(AWS_SECRET_KEY_CONFIG).value();
+        return Optional.ofNullable(secretKey).filter(s -> !s.isEmpty());
+    }
+
+    public Optional<String> awsSessionToken() {
+        final String sessionToken = getPassword(AWS_SESSION_TOKEN_CONFIG).value();
+        return Optional.ofNullable(sessionToken).filter(s -> !s.isEmpty());
+    }
+
+    public Optional<String> awsRoleArn() {
+        final String roleArn = getString(AWS_ROLE_ARN_CONFIG);
+        return Optional.ofNullable(roleArn).filter(s -> !s.isEmpty());
     }
 
     private List<String> connectionUrls() {

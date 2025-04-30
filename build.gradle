@@ -195,6 +195,11 @@ dependencies {
     integrationTestImplementation "org.apache.kafka:connect-runtime:${kafkaVersion}:test"
     integrationTestImplementation "org.apache.kafka:kafka_2.13:${kafkaVersion}"
     integrationTestImplementation "org.apache.kafka:kafka_2.13:${kafkaVersion}:test"
+
+    // AWS Dependencies
+    implementation 'com.amazonaws:aws-java-sdk-core:1.12.261'
+    implementation 'com.amazonaws:aws-java-sdk-sts:1.12.261'
+    implementation 'software.amazon.awssdk:auth:2.20.162'
 }
 
 test {
